@@ -1,686 +1,490 @@
-"use strict";
+import http from "node:http";
+import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+import { fileURLToPath } from "node:url";
+import QRCode from "qrcode";
+import pino from "pino";
+import makeWASocket, {
+  useMultiFileAuthState,
+  DisconnectReason,
+  Browsers,
+} from "@whiskeysockets/baileys";
 
-const fs = require("node:fs");
-const path = require("node:path");
-const { Client, LocalAuth, Poll } = require("whatsapp-web.js");
-const qrcode = require("qrcode-terminal");
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PORT = Number(process.env.PORT || 10000);
+const ADMIN_USER = process.env.ADMIN_USER || "admin";
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+if (!ADMIN_PASSWORD || ADMIN_PASSWORD.length < 12) {
+  console.error(
+    "Missing ADMIN_PASSWORD (at least 12 characters). Set it in Render Environment or your shell.",
+  );
+  process.exit(1);
+}
 
-// Suggestion collection is manual: only the creator's !start publishes a poll.
+// For testing, files are saved locally. Render Free erases runtime files on a
+// restart/redeploy/spin-down. Use external encrypted storage for durability.
+const AUTH_DIR = path.join(__dirname, "baileys_auth");
+const SESSIONS_FILE = path.join(__dirname, "sessions.json");
 const MAX_OPTIONS = 12;
 const MAX_OPTION_CHARS = 100;
 const MAX_QUESTION_CHARS = 255;
-const DATA_FILE = path.join(__dirname, "sessions.json");
+const logger = pino({ level: process.env.LOG_LEVEL || "warn" });
 
-const sessions = new Map(); // chatId -> { question, options, optionAuthors, creator }
-const publishing = new Set();
-
-// Startup diagnostics: authentication and readiness are different stages.
-// These logs help identify Chromium closing or WhatsApp Web failing to load.
-let clientReady = false;
-let browserDiagnosticsAttached = false;
-let pageDiagnosticsAttached = false;
-let initializationSettled = false;
+let socket = null;
+let socketGeneration = 0;
+let reconnectTimer = null;
+let qrGeneration = 0;
+let status = "starting";
+let qrDataUrl = null;
+let lastError = null;
 let shuttingDown = false;
-
-const http = require("node:http");
-
-const PORT = process.env.PORT || 10000;
-
-http
-  .createServer((req, res) => {
-    if (req.url === "/health") {
-      // The HTTP process can run while WhatsApp itself is stuck initializing.
-      // Return 503 until the official `ready` event fires.
-      res.writeHead(clientReady ? 200 : 503, {
-        "Content-Type": "application/json; charset=utf-8",
-        "Cache-Control": "no-store",
-      });
-      return res.end(
-        JSON.stringify({
-          status: clientReady ? "ready" : "not_ready",
-          whatsapp_ready: clientReady,
-        }),
-      );
-    }
-
-    res.writeHead(404);
-    res.end("Not Found");
-  })
-  .listen(PORT, "0.0.0.0", () => {
-    console.log(`Health server running on port ${PORT}`);
-  });
-
-process.on("uncaughtExceptionMonitor", (error) => {
-  console.error("[fatal] Uncaught exception:", error);
-});
-process.on("unhandledRejection", (error) => {
-  console.error("[fatal] Unhandled promise rejection:", error);
-  process.exitCode = 1;
-});
-process.on("beforeExit", (code) => {
-  if (!clientReady) {
-    console.error(
-      `[startup] Node has no remaining work (exit code ${code}), but WhatsApp never became ready.`,
-    );
-    console.error(
-      "[startup] Chromium may have closed; check browser diagnostics above.",
-    );
-  }
-});
-process.on("exit", (code) => {
-  if (!clientReady)
-    console.error(`[startup] Process exited before ready (code ${code}).`);
-});
-
-// Message#getChat() calls getChatById(), which can fail with "r: r"
-// on some WhatsApp Web versions. Read the destination from the message
-// itself, tolerating both older `_serialized` and newer `$1` ID formats.
-function getWid(value) {
-  if (typeof value === "string") return value;
-  if (!value || typeof value !== "object") return null;
-  if (typeof value._serialized === "string") return value._serialized;
-  if (typeof value.$1 === "string") return value.$1;
-  if (typeof value.user === "string" && typeof value.server === "string") {
-    return `${value.user}@${value.server}`;
-  }
-  return null;
-}
-
-function getGroupChatId(msg) {
-  const candidates = msg.fromMe
-    ? [msg.to, msg.rawData?.to, msg.id?.remote, msg.rawData?.id?.remote]
-    : [msg.from, msg.rawData?.from, msg.id?.remote, msg.rawData?.id?.remote];
-  for (const candidate of candidates) {
-    const chatId = getWid(candidate);
-    if (chatId && chatId.endsWith("@g.us")) return chatId;
-  }
-  return null;
-}
-
-// Keep creator matching strict. Falling back to the group ID for members
-// with missing author data could let other members cancel their poll.
-function getSenderId(msg) {
-  if (msg.fromMe) return "linked-account";
-  for (const candidate of [
-    msg.author,
-    msg.rawData?.author,
-    msg.id?.participant,
-    msg.rawData?.id?.participant,
-  ]) {
-    const senderId = getWid(candidate);
-    if (senderId) return senderId;
-  }
-  return null;
-}
+const sessions = new Map();
+const publishing = new Set();
+const processedMessages = new Map();
 
 function loadSessions() {
-  if (!fs.existsSync(DATA_FILE)) return;
-  const saved = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
-  if (!Array.isArray(saved)) throw new Error("sessions.json is not a list");
-  for (const item of saved) {
+  if (!fs.existsSync(SESSIONS_FILE)) return;
+  const saved = JSON.parse(fs.readFileSync(SESSIONS_FILE, "utf8"));
+  if (!Array.isArray(saved))
+    throw new Error("sessions.json must contain an array");
+  for (const entry of saved) {
     if (
-      typeof item.chatId === "string" &&
-      typeof item.question === "string" &&
-      typeof item.creator === "string" &&
-      Array.isArray(item.options)
-    ) {
-      sessions.set(item.chatId, {
-        question: item.question,
-        options: item.options,
-        // Old drafts store plain strings only. Keep them intact; the creator
-        // can remove legacy options whose original suggester is unknown.
-        optionAuthors: item.options.map((_, index) =>
-          typeof item.optionAuthors?.[index] === "string"
-            ? item.optionAuthors[index]
-            : null,
-        ),
-        creator: item.creator,
-      });
-    }
+      typeof entry.chatId !== "string" ||
+      typeof entry.question !== "string" ||
+      typeof entry.creator !== "string" ||
+      !Array.isArray(entry.options)
+    )
+      continue;
+    sessions.set(entry.chatId, {
+      question: entry.question,
+      creator: entry.creator,
+      options: entry.options,
+      optionAuthors: entry.options.map(
+        (_, i) => entry.optionAuthors?.[i] ?? null,
+      ),
+    });
   }
 }
 
 function saveSessions() {
-  const tmp = `${DATA_FILE}.tmp`;
+  const temp = `${SESSIONS_FILE}.tmp`;
   fs.writeFileSync(
-    tmp,
+    temp,
     JSON.stringify(
       [...sessions].map(([chatId, session]) => ({ chatId, ...session })),
       null,
       2,
     ),
+    { mode: 0o600 },
   );
-  fs.renameSync(tmp, DATA_FILE);
+  fs.renameSync(temp, SESSIONS_FILE);
 }
 
-const client = new Client({
-  authStrategy: new LocalAuth({
-    dataPath: path.join(__dirname, ".wwebjs_auth"),
-  }),
-  puppeteer: {
-    headless: true,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--no-first-run",
-    ],
-  },
-});
+// Protected Basic Auth on HTTPS. Do not put the QR code in public URLs or logs.
+function matchesSecret(given, expected) {
+  const a = crypto.createHash("sha256").update(given).digest();
+  const b = crypto.createHash("sha256").update(expected).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+function isAdmin(req) {
+  const header = req.headers.authorization || "";
+  if (!header.startsWith("Basic ")) return false;
+  try {
+    const decoded = Buffer.from(header.slice(6), "base64").toString("utf8");
+    const sep = decoded.indexOf(":");
+    if (sep < 0) return false;
+    return (
+      matchesSecret(decoded.slice(0, sep), ADMIN_USER) &&
+      matchesSecret(decoded.slice(sep + 1), ADMIN_PASSWORD)
+    );
+  } catch {
+    return false;
+  }
+}
+
+const loginPage = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WhatsApp Voting Bot Login</title>
+<style>
+body{font-family:system-ui,-apple-system,sans-serif;background:#f5f7f6;color:#17211b;min-height:100vh;margin:0;display:grid;place-items:center}
+main{background:white;border:1px solid #dfe8e3;border-radius:18px;padding:28px;max-width:410px;width:calc(100% - 48px);text-align:center;box-shadow:0 12px 35px #1233}
+h1{font-size:23px;margin:4px 0 14px}p{line-height:1.5;color:#56645a}#status{font-weight:650;margin:16px 0}img{width:280px;max-width:100%;height:auto;background:white;border:1px solid #eee;border-radius:9px}small{color:#607064}
+</style></head><body><main><h1>WhatsApp Voting Bot</h1><div id="status">Connecting…</div><img id="qr" alt="WhatsApp linking QR code" hidden>
+<p id="guide">Open WhatsApp on your phone → Linked Devices → Link a Device.</p>
+<small>Private admin page. The QR code expires and refreshes automatically.</small></main>
+<script>
+async function update(){try{const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)throw new Error('Status '+r.status);const d=await r.json();
+const labels={starting:'Starting bot…',connecting:'Connecting to WhatsApp…',qr:'Scan this QR code',connected:'✅ WhatsApp connected',logged_out:'Session logged out; restart pairing',disconnected:'Disconnected — reconnecting…',error:'Connection error'};
+document.getElementById('status').textContent=labels[d.status]||d.status;
+const im=document.getElementById('qr');im.hidden=!d.qr; if(d.qr)im.src=d.qr;else im.removeAttribute('src');
+document.getElementById('guide').textContent=d.status==='connected'?'Bot is connected. Use !help in your WhatsApp group.':(d.error||'Open WhatsApp on your phone → Linked Devices → Link a Device.');
+}catch(e){document.getElementById('status').textContent='Cannot read bot status';}}
+update();setInterval(update,3000);
+</script></body></html>`;
+
+http
+  .createServer((req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("X-Frame-Options", "DENY");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    if (req.url === "/health") {
+      res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+      return res.end("alive"); // Render liveness, not WhatsApp readiness.
+    }
+    if (req.url === "/ready") {
+      const ready = status === "connected";
+      res.writeHead(ready ? 200 : 503, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ready }));
+    }
+    if (req.url !== "/login" && req.url !== "/api/status" && req.url !== "/") {
+      res.writeHead(404);
+      return res.end("Not found");
+    }
+    if (!isAdmin(req)) {
+      res.setHeader(
+        "WWW-Authenticate",
+        'Basic realm="WhatsApp Bot Admin", charset="UTF-8"',
+      );
+      res.writeHead(401);
+      return res.end("Authentication required");
+    }
+    if (req.url === "/api/status") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(
+        JSON.stringify({ status, qr: qrDataUrl, error: lastError }),
+      );
+    }
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(loginPage);
+  })
+  .listen(PORT, "0.0.0.0", () =>
+    console.log(`[http] Listening on ${PORT}; open /login`),
+  );
+
+function messageText(message) {
+  let m = message?.message;
+  if (!m) return "";
+  m = m.ephemeralMessage?.message || m.viewOnceMessage?.message || m;
+  return (m.conversation || m.extendedTextMessage?.text || "").trim();
+}
+
+function isFresh(message) {
+  // Ignore replayed historic commands after reconnect. Own messages on other
+  // linked devices may come through as 'append'; recent ones are allowed.
+  const raw = message.messageTimestamp;
+  const seconds =
+    typeof raw === "object" &&
+    raw !== null &&
+    typeof raw.toNumber === "function"
+      ? raw.toNumber()
+      : Number(raw);
+  return (
+    Number.isFinite(seconds) &&
+    seconds > Date.now() / 1000 - 120 &&
+    seconds < Date.now() / 1000 + 60
+  );
+}
+
+function getSender(message) {
+  // Compatible with creator='linked-account' in old sessions.json files.
+  if (message.key.fromMe) return "linked-account";
+  return message.key.participant || null;
+}
 
 async function send(chatId, text) {
-  await client.sendMessage(chatId, text);
+  if (status !== "connected" || !socket)
+    throw new Error("WhatsApp not connected");
+  return socket.sendMessage(chatId, { text });
 }
 
-async function finalizePoll(chatId) {
+async function publish(chatId) {
   if (publishing.has(chatId)) return;
   const session = sessions.get(chatId);
   if (!session) return;
-
-  // Keep the draft open until it has at least two suggestions.
   if (session.options.length < 2) {
     await send(
       chatId,
-      "Add at least 2 different options before using !start. Suggestions stay open until you start or cancel the poll.",
+      "Add at least two different options before using !start.",
     );
     return;
   }
-
   publishing.add(chatId);
   try {
-    await client.sendMessage(
-      chatId,
-      new Poll(session.question, session.options, {
-        allowMultipleAnswers: false,
-      }),
-    );
-    console.log(`Poll published in ${chatId}: ${session.question}`);
+    await socket.sendMessage(chatId, {
+      poll: {
+        name: session.question,
+        values: session.options,
+        selectableCount: 1,
+      },
+    });
     sessions.delete(chatId);
     saveSessions();
+    console.log("[poll] Published", chatId);
   } catch (error) {
-    console.error(`Unable to publish poll for ${chatId}:`, error);
-    // Keep the choices saved. !start lets the creator retry after an error.
-    try {
-      await send(
-        chatId,
-        "⚠️ Could not publish the poll. Creator: send !start to retry.",
-      );
-    } catch (messageError) {
-      console.error("Unable to send failure notice:", messageError);
-    }
+    console.error("[poll] Publication failed:", error.message);
+    await send(
+      chatId,
+      "⚠️ Could not publish poll. Creator can retry !start.",
+    ).catch(() => {});
   } finally {
     publishing.delete(chatId);
   }
 }
 
-// Temporary workaround for whatsapp-web.js 1.34.7: on some restored sessions,
-// a transient Chromium iframe disappears during the library's exposeFunction
-// calls in attachEventListeners(). The upstream authenticated callback can
-// reject without delivering the error to client.initialize().catch(...).
-// Retry ONLY those transient browser/frame failures; do not fabricate READY.
-function installTransientListenerSetupRetry(waClient) {
-  const originalAttach = waClient.attachEventListeners.bind(waClient);
-  waClient.attachEventListeners = async (...args) => {
-    const maxAttempts = 4;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      try {
-        await originalAttach(...args);
-        if (attempt > 1) {
-          console.log(
-            `[startup] Message listener setup recovered on attempt ${attempt}.`,
-          );
-        }
-        return;
-      } catch (error) {
-        const message = String(error?.message ?? error);
-        console.error(
-          `[startup] Message listener setup failed (${attempt}/${maxAttempts}):`,
-          message.slice(0, 500),
-        );
-        const transient =
-          /Target closed|Frame was detached|No frame for given id|Execution context was destroyed|Cannot find context with specified id|Protocol error \(Runtime\.addBinding\)/i.test(
-            message,
-          );
-        const browserAlive = Boolean(
-          waClient.pupBrowser?.isConnected() &&
-          waClient.pupPage &&
-          !waClient.pupPage.isClosed(),
-        );
-        if (!transient || !browserAlive || attempt === maxAttempts) {
-          throw error;
-        }
-        await new Promise((resolve) => setTimeout(resolve, attempt * 500));
-      }
-    }
-  };
-}
+async function handleCommand(message) {
+  const chatId = message.key.remoteJid;
+  if (typeof chatId !== "string" || !chatId.endsWith("@g.us")) return;
+  if (!isFresh(message)) return;
+  const text = messageText(message);
+  if (!text.startsWith("!")) return;
+  const [cmd] = text.split(/\s+/, 1);
+  const command = cmd.toLowerCase();
+  const argument = text.slice(cmd.length).trim().replace(/\s+/g, " ");
+  const known = new Set([
+    "!help",
+    "!poll",
+    "!add",
+    "!remove",
+    "!options",
+    "!start",
+    "!cancel",
+    "!extend",
+  ]);
+  if (!known.has(command)) return;
+  const sender = getSender(message);
+  const session = sessions.get(chatId);
+  console.log(
+    "[command]",
+    command,
+    "group:",
+    chatId,
+    "fromMe:",
+    Boolean(message.key.fromMe),
+  );
 
-installTransientListenerSetupRetry(client);
+  if (command === "!help")
+    return send(
+      chatId,
+      "🗳️ Voting bot commands:\n!poll <question> — open suggestions\n!add <option> — suggest a choice\n" +
+        "!remove <number or name> — delete your own suggestion (creator can delete any)\n" +
+        "!options — show suggestions\n!start — publish native poll (creator only)\n!cancel — cancel draft (creator only)",
+    );
 
-client.on("qr", (qr) => {
-  console.log("Scan this QR in WhatsApp > Linked Devices > Link a Device:");
-  qrcode.generate(qr, { small: true });
-});
-
-function attachBrowserDiagnostics() {
-  const browser = client.pupBrowser;
-  if (browser && !browserDiagnosticsAttached) {
-    browserDiagnosticsAttached = true;
-    browser.on("disconnected", () => {
-      console.error(
-        "[browser] Chromium disconnected. This prevents the bot from becoming ready.",
+  if (command === "!poll") {
+    if (!sender) return;
+    if (session)
+      return send(chatId, "A poll is already being prepared. Send !options.");
+    if (!argument || argument.length > MAX_QUESTION_CHARS)
+      return send(
+        chatId,
+        `Use !poll <question> (up to ${MAX_QUESTION_CHARS} characters).`,
       );
+    sessions.set(chatId, {
+      question: argument,
+      creator: sender,
+      options: [],
+      optionAuthors: [],
     });
-    console.log(`[browser] Chromium connected: ${browser.isConnected()}`);
-  }
-
-  const page = client.pupPage;
-  if (page && !pageDiagnosticsAttached) {
-    pageDiagnosticsAttached = true;
-    page.on("pageerror", (error) =>
-      console.error("[page] JavaScript error:", error),
+    saveSessions();
+    return send(
+      chatId,
+      `🗳️ *${argument}*\nSuggestions stay open until the creator sends !start.\nAnyone can !add <option>.`,
     );
-    page.on("error", (error) =>
-      console.error("[page] Browser page error:", error),
+  }
+
+  if (!session)
+    return send(chatId, "No draft poll. Use !poll <question> first.");
+  if (publishing.has(chatId))
+    return send(chatId, "The poll is being published.");
+
+  if (command === "!add") {
+    if (!sender) return send(chatId, "Could not identify your group account.");
+    if (!argument || argument.length > MAX_OPTION_CHARS)
+      return send(
+        chatId,
+        `Use !add <option> (up to ${MAX_OPTION_CHARS} characters).`,
+      );
+    if (session.options.some((x) => x.toLowerCase() === argument.toLowerCase()))
+      return send(chatId, "That option already exists.");
+    if (session.options.length >= MAX_OPTIONS)
+      return send(chatId, "Maximum 12 options reached.");
+    session.options.push(argument);
+    session.optionAuthors.push(sender);
+    saveSessions();
+    return send(
+      chatId,
+      `✅ Added ${argument} (${session.options.length}/${MAX_OPTIONS})`,
     );
-    page.on("close", () => console.error("[page] WhatsApp Web page closed."));
-    console.log(`[browser] WhatsApp Web page open: ${!page.isClosed()}`);
   }
-}
 
-// Temporary diagnostics: capture errors in page evaluations that happen AFTER
-// authentication. The library may catch/reject them inside exposed callbacks,
-// so they don't always reach the .initialize().catch(...) handler.
-function attachInitializationDiagnostics() {
-  const page = client.pupPage;
-  if (!page || page.__botEvaluateDiagnostic) return;
-  const originalEvaluate = page.evaluate.bind(page);
-  page.evaluate = async (...args) => {
-    try {
-      return await originalEvaluate(...args);
-    } catch (error) {
-      console.error(
-        "[startup] WhatsApp page evaluation failed:",
-        String(error?.message ?? error).slice(0, 500),
-      );
-      throw error;
-    }
-  };
-  page.__botEvaluateDiagnostic = true;
-}
-
-client.on("authenticated", () => {
-  console.log("Authenticated (saved WhatsApp login accepted).");
-  attachBrowserDiagnostics();
-  attachInitializationDiagnostics();
-});
-client.on("change_state", (state) => console.log("[whatsapp state]", state));
-
-client.on("auth_failure", (err) =>
-  console.error("Authentication failed:", err),
-);
-client.on("disconnected", (reason) =>
-  console.warn("WhatsApp disconnected:", reason),
-);
-
-client.on("ready", () => {
-  clientReady = true;
-  attachBrowserDiagnostics();
-  console.log(
-    "✅ WhatsApp Voting Bot ready. Suggestions stay open until !start.",
-  );
-});
-
-client.on("message_create", async (msg) => {
-  // message_create includes commands sent by the linked WhatsApp account itself.
-  // The bot's own responses do not start with '!', so they won't cause a loop.
-  if (typeof msg.body !== "string") return;
-  const input = msg.body.trim();
-  if (!input.startsWith("!")) return;
-  console.log(
-    `[command received] ${input.split(/\s+/, 1)[0]} (fromMe=${msg.fromMe})`,
-  );
-
-  const space = input.search(/\s/);
-  const command = (space === -1 ? input : input.slice(0, space)).toLowerCase();
-  const argument = (space === -1 ? "" : input.slice(space).trim()).replace(
-    /\s+/g,
-    " ",
-  );
-  if (
-    ![
-      "!poll",
-      "!add",
-      "!remove",
-      "!options",
-      "!extend",
-      "!start",
-      "!cancel",
-      "!help",
-    ].includes(command)
-  )
-    return;
-
-  try {
-    // Avoid msg.getChat(): it invokes getChatById(), which currently fails
-    // for some WhatsApp Web builds with a cryptic Puppeteer `r: r` error.
-    const chatId = getGroupChatId(msg);
-    if (!chatId) {
-      console.log(
-        `[command ignored] Not a group chat (fromMe=${msg.fromMe}, from=${msg.from}, to=${msg.to}).`,
-      );
-      return; // Never respond in private chats.
-    }
-    const senderId = getSenderId(msg);
-    const session = sessions.get(chatId);
-
-    if (command === "!help") {
-      await send(
-        chatId,
-        "🗳️ Voting commands:\n" +
-          "!poll <question> — begin collecting suggestions\n" +
-          "!add <option> — suggest an answer\n" +
-          "!remove <number or name> — remove your suggestion (creator can remove any)\n" +
-          "!options — see current suggestions\n" +
-          "!start — publish the poll (creator only)\n" +
-          "!cancel — cancel (creator only)",
-      );
-      return;
-    }
-
-    if (command === "!poll") {
-      if (!senderId) {
-        console.warn("[command ignored] Could not identify poll creator.");
-        return;
-      }
-      if (session) {
-        await send(
-          chatId,
-          "There is already a poll being prepared. Use !options to see it.",
+  if (command === "!remove") {
+    if (!argument)
+      return send(chatId, "Use !options, then !remove 2 or !remove Sushi.");
+    const index = /^\d+$/.test(argument)
+      ? Number(argument) - 1
+      : session.options.findIndex(
+          (x) => x.toLowerCase() === argument.toLowerCase(),
         );
-        return;
-      }
-      if (!argument || argument.length > MAX_QUESTION_CHARS) {
-        await send(
-          chatId,
-          `Use: !poll <question> (up to ${MAX_QUESTION_CHARS} characters).`,
-        );
-        return;
-      }
-      sessions.set(chatId, {
-        question: argument,
-        options: [],
-        optionAuthors: [],
-        creator: senderId,
-      });
-      saveSessions();
-      await send(
+    if (
+      !Number.isSafeInteger(index) ||
+      index < 0 ||
+      index >= session.options.length
+    )
+      return send(chatId, "Option not found. Send !options to see the list.");
+    if (
+      !sender ||
+      (sender !== session.creator && sender !== session.optionAuthors[index])
+    )
+      return send(
         chatId,
-        `🗳️ *${argument}*\n\n` +
-          "Suggestions are open with no deadline.\n" +
-          "Anyone can send !add <option>.\n" +
-          "Use !options to see them and !remove <number> to correct your own suggestion.\n" +
-          "The creator sends !start to publish or !cancel to cancel.",
+        "You can only delete your own suggestion; the creator can delete any.",
       );
-      return;
-    }
-
-    if (!session) {
-      await send(
-        chatId,
-        "No poll is collecting suggestions. Use !poll <question> to create one.",
-      );
-      return;
-    }
-
-    if (publishing.has(chatId)) {
-      await send(chatId, "This poll is being published.");
-      return;
-    }
-
-    if (command === "!add") {
-      if (!senderId) {
-        await send(
-          chatId,
-          "Could not identify your WhatsApp account. Please try again.",
-        );
-        return;
-      }
-      if (!argument || argument.length > MAX_OPTION_CHARS) {
-        await send(
-          chatId,
-          `Use: !add <option> (up to ${MAX_OPTION_CHARS} characters).`,
-        );
-        return;
-      }
-      if (
-        session.options.some(
-          (option) =>
-            option.toLocaleLowerCase() === argument.toLocaleLowerCase(),
-        )
-      ) {
-        await send(chatId, "That option has already been suggested.");
-        return;
-      }
-      if (session.options.length >= MAX_OPTIONS) {
-        await send(
-          chatId,
-          `Maximum ${MAX_OPTIONS} options reached. The creator can send !start now.`,
-        );
-        return;
-      }
-      session.options.push(argument);
-      session.optionAuthors.push(senderId);
-      saveSessions();
-      await send(
-        chatId,
-        `✅ Added: ${argument} (${session.options.length}/${MAX_OPTIONS})`,
-      );
-      return;
-    }
-
-    if (command === "!remove") {
-      if (!argument) {
-        await send(
-          chatId,
-          "Use !options to see the list, then !remove 2 or !remove Sushi.",
-        );
-        return;
-      }
-      // A number refers to the *current* 1-based list; a name must match an
-      // existing suggestion. Never remove the first option on invalid input.
-      const optionIndex = /^\d+$/.test(argument)
-        ? Number(argument) - 1
-        : session.options.findIndex(
-            (name) => name.toLocaleLowerCase() === argument.toLocaleLowerCase(),
-          );
-      if (
-        !Number.isSafeInteger(optionIndex) ||
-        optionIndex < 0 ||
-        optionIndex >= session.options.length
-      ) {
-        await send(
-          chatId,
-          "Option not found. Send !options to see the current numbered list.",
-        );
-        return;
-      }
-      const isCreator = Boolean(senderId && senderId === session.creator);
-      const isAuthor = Boolean(
-        senderId && senderId === session.optionAuthors[optionIndex],
-      );
-      if (!isCreator && !isAuthor) {
-        await send(
-          chatId,
-          "You can only remove suggestions you added. The poll creator can remove any suggestion.",
-        );
-        return;
-      }
-      const [removed] = session.options.splice(optionIndex, 1);
-      session.optionAuthors.splice(optionIndex, 1);
-      saveSessions();
-      await send(
-        chatId,
-        `🗑️ Removed: ${removed}\nUse !add <option> to submit a corrected choice.`,
-      );
-      return;
-    }
-
-    if (command === "!options") {
-      const list = session.options.length
-        ? session.options.map((name, i) => `${i + 1}. ${name}`).join("\n")
-        : "No suggestions yet.";
-      await send(
-        chatId,
-        `📋 *${session.question}*\n${list}\n\nSuggestions are open until the creator sends !start.`,
-      );
-      return;
-    }
-
-    if (!senderId || senderId !== session.creator) {
-      await send(
-        chatId,
-        "Only the person who created this poll can use that command.",
-      );
-      return;
-    }
-
-    if (command === "!extend") {
-      await send(
-        chatId,
-        "⏳ Suggestions already have no time limit. Send !start whenever you are ready to publish.",
-      );
-    } else if (command === "!cancel") {
-      sessions.delete(chatId);
-      saveSessions();
-      await send(chatId, "🚫 Suggestion collection cancelled.");
-    } else if (command === "!start") {
-      await finalizePoll(chatId);
-    }
-  } catch (error) {
-    console.error("Failed to handle a group command:", error);
+    const [removed] = session.options.splice(index, 1);
+    session.optionAuthors.splice(index, 1);
+    saveSessions();
+    return send(
+      chatId,
+      `🗑️ Removed ${removed}. Send !add <option> to correct it.`,
+    );
   }
-});
 
-try {
-  loadSessions();
-} catch (error) {
-  console.error(
-    "Cannot read saved sessions. Fix sessions.json before starting:",
-    error,
-  );
-  process.exit(1);
+  if (command === "!options") {
+    const list =
+      session.options.map((x, i) => `${i + 1}. ${x}`).join("\n") ||
+      "No suggestions yet.";
+    return send(
+      chatId,
+      `📋 *${session.question}*\n${list}\n\nSuggestions stay open until !start.`,
+    );
+  }
+
+  if (!sender || sender !== session.creator)
+    return send(chatId, "Only the poll creator can use that command.");
+  if (command === "!extend")
+    return send(chatId, "Suggestions are already unlimited until !start.");
+  if (command === "!cancel") {
+    sessions.delete(chatId);
+    saveSessions();
+    return send(chatId, "🚫 Draft poll cancelled.");
+  }
+  if (command === "!start") return publish(chatId);
 }
 
-// Ctrl+C normally kills the Node process immediately. Close the browser
-// cleanly instead, giving Chromium a chance to flush the saved LocalAuth
-// profile. This improves shutdown hygiene, but cannot prevent every upstream
-// WhatsApp Web "authenticated but not ready" bug.
-async function shutdown(signal) {
+async function connect() {
   if (shuttingDown) return;
-  shuttingDown = true;
-  console.log(`[shutdown] ${signal}: closing WhatsApp Web cleanly...`);
-  const deadline = setTimeout(() => {
-    console.error(
-      "[shutdown] Browser did not close in 10 seconds. Forcing exit.",
-    );
-    process.exit(1);
-  }, 10_000);
-  try {
-    if (client.pupBrowser?.isConnected()) {
-      await client.destroy();
+  const generation = ++socketGeneration;
+  status = "connecting";
+  qrDataUrl = null;
+  lastError = null;
+  const { state: authState, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+  const sock = makeWASocket({
+    auth: authState,
+    browser: Browsers.ubuntu("Voting Bot"),
+    logger,
+    printQRInTerminal: false,
+    markOnlineOnConnect: false,
+    syncFullHistory: false,
+    emitOwnEvents: true,
+  });
+  socket = sock;
+  sock.ev.on("creds.update", saveCreds);
+  sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    if (generation !== socketGeneration || status !== "connected") return;
+    for (const message of messages) {
+      // Only live inbound messages, plus recent own-account commands from the
+      // phone, not old history; never process our own echoed bot text.
+      if (type !== "notify" && !(message.key.fromMe && type === "append"))
+        continue;
+      const id = message.key.id;
+      const unique = `${message.key.remoteJid}:${id}`;
+      if (!id || processedMessages.has(unique)) continue;
+      processedMessages.set(unique, Date.now());
+      if (processedMessages.size > 2000) {
+        const oldest = [...processedMessages.keys()].slice(0, 500);
+        oldest.forEach((key) => processedMessages.delete(key));
+      }
+      try {
+        await handleCommand(message);
+      } catch (err) {
+        console.error("[command] Failed:", err.message);
+      }
     }
-    console.log("[shutdown] Browser closed. Saved polls are preserved.");
-    process.exitCode = 0;
-  } catch (error) {
-    console.error("[shutdown] Error while closing Chromium:", error);
-    process.exitCode = 1;
-  } finally {
-    clearTimeout(deadline);
-    // Do not leave stray browser handles running after Ctrl+C.
-    process.exit(process.exitCode);
+  });
+  sock.ev.on(
+    "connection.update",
+    async ({ connection, qr, lastDisconnect }) => {
+      if (generation !== socketGeneration || shuttingDown) return;
+      if (qr) {
+        const qrId = ++qrGeneration;
+        try {
+          const image = await QRCode.toDataURL(qr, { width: 300, margin: 2 });
+          if (generation === socketGeneration && qrId === qrGeneration) {
+            qrDataUrl = image;
+            status = "qr";
+            console.log("[auth] QR available at protected /login page");
+          }
+        } catch (err) {
+          console.error("[auth] QR generation failed:", err.message);
+        }
+      }
+      if (connection === "open") {
+        qrGeneration++;
+        qrDataUrl = null;
+        status = "connected";
+        lastError = null;
+        console.log("✅ WhatsApp Voting Bot connected. Try !help in a group.");
+      }
+      if (connection === "close") {
+        qrGeneration++;
+        qrDataUrl = null;
+        const code = lastDisconnect?.error?.output?.statusCode;
+        const loggedOut = code === DisconnectReason.loggedOut;
+        status = loggedOut ? "logged_out" : "disconnected";
+        lastError = loggedOut
+          ? "Logged out. Re-pair the WhatsApp account."
+          : null;
+        console.log(
+          "[connection] Closed; code:",
+          code,
+          "loggedOut:",
+          loggedOut,
+        );
+        if (!loggedOut) {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = setTimeout(
+            () => connect().catch(onStartupError),
+            3000,
+          );
+        }
+      }
+    },
+  );
+}
+
+function onStartupError(error) {
+  status = "error";
+  lastError = "Cannot connect; check Render logs.";
+  console.error("[startup] Failed:", error);
+  if (!shuttingDown) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(() => connect().catch(onStartupError), 10000);
   }
 }
-process.on("SIGINT", () => shutdown("Ctrl+C"));
-process.on("SIGTERM", () => shutdown("SIGTERM"));
 
-console.log("[startup] Initializing WhatsApp Web...");
+function shutdown() {
+  shuttingDown = true;
+  clearTimeout(reconnectTimer);
+  status = "disconnected";
+  try {
+    socket?.ws?.close();
+  } catch {}
+  process.exit(0);
+}
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
 
-// This diagnostic does NOT start a voting timer or publish anything.
-// It only warns if startup has not completed. Unref keeps it from hiding
-// a browser failure by artificially keeping Node alive.
-const startupWarning = setTimeout(() => {
-  if (!clientReady) {
-    console.error(
-      "[startup] Still not ready. Browser connected:",
-      client.pupBrowser ? client.pupBrowser.isConnected() : "not launched",
-    );
-    console.error(
-      "[startup] Page closed:",
-      client.pupPage ? client.pupPage.isClosed() : "not opened",
-    );
-    console.error(
-      "[startup] Client.initialize() settled:",
-      initializationSettled,
-    );
-    console.error(
-      "[startup] Library version:",
-      require("whatsapp-web.js/package.json").version,
-    );
-    console.error("[startup] Internal setup:", {
-      hasClientInfo: Boolean(client.info),
-      hasMessageInterface: Boolean(client.interface),
-    });
-    // Read only high-level status: no messages, phone numbers or auth tokens.
-    // Newer wwebjs releases do NOT require window.Store; don't use it as a
-    // readiness test. The official 'ready' event remains authoritative.
-    const page = client.pupPage;
-    if (page && !page.isClosed()) {
-      page
-        .evaluate(() => {
-          let socket = null;
-          try {
-            socket = window.require("WAWebSocketModel").Socket;
-          } catch (_) {
-            /* internal module may not yet be available */
-          }
-          return {
-            pageReady: document.readyState,
-            webVersion: String(window.Debug?.VERSION ?? "unknown"),
-            hasWWebJS: Boolean(window.WWebJS),
-            hasAuthStore: Boolean(window.AuthStore),
-            socketState: socket?.state ?? "unknown",
-            hasSynced: socket?.hasSynced ?? "unknown",
-            hasMessageEventBridge:
-              typeof window.onAddMessageEvent === "function",
-          };
-        })
-        .then((status) => {
-          console.error("[startup] WhatsApp page state:", status);
-        })
-        .catch((error) => {
-          console.error(
-            "[startup] Could not inspect WhatsApp page:",
-            String(error?.message ?? error).slice(0, 300),
-          );
-        });
-    }
-    console.error(
-      "[startup] Authenticated but not ready: check library version, internal setup and page state above.",
-    );
-  }
-}, 20_000);
-startupWarning.unref();
-
-client
-  .initialize()
-  .then(() => {
-    initializationSettled = true;
-    console.log("[startup] Client.initialize() completed.");
-  })
-  .catch((error) => {
-    initializationSettled = true;
-    console.error("[startup] Could not initialize WhatsApp:", error);
-    process.exitCode = 1;
-  });
+loadSessions();
+console.log("[startup] Initializing WhatsApp via Baileys (no Chromium)...");
+connect().catch(onStartupError);
